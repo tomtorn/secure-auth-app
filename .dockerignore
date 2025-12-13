@@ -1,0 +1,50 @@
+# Dependencies (all workspaces)
+**/node_modules
+
+# Build outputs (rebuild in Docker)
+**/dist
+server/dist
+client/dist
+packages/*/dist
+
+# Environment files
+**/.env
+**/.env.*
+!**/.env.example
+
+# Client (not needed for server image)
+client
+
+# Development files
+**/*.log
+**/npm-debug.log*
+**/.npm
+
+# Testing
+**/coverage
+**/.nyc_output
+**/__tests__
+
+# IDE
+.vscode
+.idea
+**/*.swp
+**/*.swo
+
+# Git
+.git
+.gitignore
+.husky
+
+# Docker files
+**/Dockerfile
+**/.dockerignore
+**/docker-compose*.yml
+
+# Documentation
+**/README.md
+**/docs
+
+# Misc
+**/.DS_Store
+**/Thumbs.db

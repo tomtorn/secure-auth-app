@@ -1,0 +1,43 @@
+# Dependencies
+node_modules
+
+# Build output (we rebuild in Docker)
+dist
+
+# Environment files (secrets should come from ECS task definition)
+.env
+.env.*
+!.env.example
+
+# Development files
+*.log
+npm-debug.log*
+.npm
+
+# Testing
+coverage
+.nyc_output
+src/__tests__
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+
+# Git
+.git
+.gitignore
+
+# Docker
+Dockerfile
+.dockerignore
+docker-compose*.yml
+
+# Documentation
+README.md
+docs
+
+# Misc
+.DS_Store
+Thumbs.db
