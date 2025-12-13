@@ -1,0 +1,672 @@
+# =============================================================================
+# SecureAuth - Production CI/CD Pipeline
+# =============================================================================
+#
+# This workflow handles the complete deployment pipeline:
+# 1. Lint, type-check, and test all workspaces
+# 2. Build Docker image and push to AWS ECR with semantic tagging
+# 3. Run Prisma migrations against RDS (with safety checks)
+# 4. Deploy to ECS Fargate with health verification
+# 5. Send deployment notifications
+#
+# Note: Amplify deploys automatically via GitHub webhook (not managed here)
+#
+# REQUIRED GITHUB SECRETS:
+# - AWS_ROLE_ARN: IAM role ARN for GitHub Actions OIDC
+# - AWS_ACCOUNT_ID: AWS account ID
+#
+# REQUIRED AWS SECRETS MANAGER ENTRIES:
+# - secure-auth/database-url
+# - secure-auth/direct-url
+# - secure-auth/supabase-url
+# - secure-auth/supabase-anon-key
+# - secure-auth/supabase-service-role-key
+# - secure-auth/frontend-url
+# - secure-auth/csrf-secret          (generate with: openssl rand -hex 32)
+# - secure-auth/redis-url            (optional, for distributed rate limiting)
+#
+# =============================================================================
+
+name: Deploy to AWS
+
+on:
+  push:
+    branches: [main]
+    # Only trigger on relevant file changes to save CI minutes
+    paths:
+      - 'server/**'
+      - 'packages/**'
+      - 'client/**'
+      - 'infrastructure/**'
+      - '.github/workflows/**'
+      - 'package*.json'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      skip_migrations:
+        description: 'Skip Prisma migrations'
+        required: false
+        default: false
+        type: boolean
+      deploy_environment:
+        description: 'Deployment environment'
+        required: false
+        default: 'production'
+        type: choice
+        options:
+          - production
+          - staging
+
+# =============================================================================
+# ENVIRONMENT VARIABLES
+# =============================================================================
+env:
+  AWS_REGION: eu-north-1
+  ECR_REPOSITORY: secure-auth-server
+  ECS_CLUSTER: secure-auth-cluster
+  ECS_SERVICE: secure-auth-service
+  ECS_TASK_DEFINITION: infrastructure/aws/ecs-task-definition.json
+  # Node version must match Dockerfile
+  NODE_VERSION: '20'
+
+# =============================================================================
+# PERMISSIONS
+# =============================================================================
+# Minimal permissions following principle of least privilege
+permissions:
+  id-token: write       # Required for OIDC authentication with AWS
+  contents: read        # Required for checking out code
+  actions: read         # Required for workflow status checks
+  pull-requests: write  # Required for PR comments
+  security-events: write  # Required for uploading Trivy scan results to GitHub Security
+
+# =============================================================================
+# CONCURRENCY
+# =============================================================================
+# Prevent concurrent deployments to same environment
+# This avoids race conditions where two deployments could conflict
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false  # Don't cancel in-progress deploys; wait instead
+
+jobs:
+  # ===========================================================================
+  # JOB 1: QUALITY GATES (Lint, Type-check, Test)
+  # ===========================================================================
+  # This job runs on every push and PR to catch issues early.
+  # All subsequent jobs depend on this passing.
+  # ===========================================================================
+  quality-gates:
+    name: 🔍 Quality Gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      # -----------------------------------------------------------------------
+      # Step 1.1: Checkout code
+      # -----------------------------------------------------------------------
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          # Fetch full history for proper change detection
+          fetch-depth: 0
+
+      # -----------------------------------------------------------------------
+      # Step 1.2: Setup Node.js with npm cache
+      # -----------------------------------------------------------------------
+      # Caching reduces install time from ~30s to ~5s
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      # -----------------------------------------------------------------------
+      # Step 1.3: Install dependencies
+      # -----------------------------------------------------------------------
+      # --ignore-scripts prevents husky install in CI
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      # -----------------------------------------------------------------------
+      # Step 1.4: Build shared packages first
+      # -----------------------------------------------------------------------
+      # @secure-auth/schemas must be built before server can type-check
+      # Clean any stale build artifacts first to ensure fresh types
+      - name: Build shared packages
+        run: |
+          rm -rf packages/schemas/dist
+          npm run build --workspace=@secure-auth/schemas
+          ls -la packages/schemas/dist
+
+      # -----------------------------------------------------------------------
+      # Step 1.4.1: Generate Prisma Client
+      # -----------------------------------------------------------------------
+      # Prisma client must be generated before server can type-check
+      - name: Generate Prisma Client
+        run: npx prisma generate
+        working-directory: server
+
+      # -----------------------------------------------------------------------
+      # Step 1.5: Run ESLint on all workspaces
+      # -----------------------------------------------------------------------
+      # --max-warnings=0 ensures warnings are treated as errors
+      - name: Lint all workspaces
+        run: npm run lint
+
+      # -----------------------------------------------------------------------
+      # Step 1.6: TypeScript type-checking
+      # -----------------------------------------------------------------------
+      # Separate from build to catch type errors early
+      # Clean server dist first to ensure fresh build with updated schemas types
+      - name: Type-check server
+        run: |
+          rm -rf server/dist server/*.tsbuildinfo
+          npm run build --workspace=server
+        # This compiles TypeScript; if it fails, types are broken
+
+      - name: Type-check client
+        run: npx tsc --noEmit
+        working-directory: client
+
+      # -----------------------------------------------------------------------
+      # Step 1.7: Run unit tests
+      # -----------------------------------------------------------------------
+      - name: Run server tests
+        run: npm test --workspace=server
+        env:
+          # Ensure tests run in test mode
+          NODE_ENV: test
+
+      # -----------------------------------------------------------------------
+      # Step 1.8: Upload test coverage (optional)
+      # -----------------------------------------------------------------------
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        if: always()
+        continue-on-error: true
+        with:
+          name: coverage-report
+          path: server/coverage
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # ===========================================================================
+  # JOB 2: BUILD AND PUSH DOCKER IMAGE
+  # ===========================================================================
+  # Builds the production Docker image and pushes to ECR.
+  # Uses multi-tag strategy: commit SHA, branch name, and 'latest'.
+  # Only runs on main branch (not PRs).
+  # ===========================================================================
+  build-and-push:
+    name: 🐳 Build & Push Docker
+    runs-on: ubuntu-latest
+    needs: quality-gates
+    # Only build on main branch pushes or manual triggers, not PRs
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
+    timeout-minutes: 15
+    outputs:
+      image: ${{ steps.output-image.outputs.image }}
+      image_tag: ${{ steps.meta.outputs.version }}
+
+    steps:
+      # -----------------------------------------------------------------------
+      # Step 2.1: Checkout code
+      # -----------------------------------------------------------------------
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      # Step 2.2: Configure AWS credentials using OIDC
+      # -----------------------------------------------------------------------
+      # OIDC is more secure than long-lived access keys
+      # No secrets stored in GitHub; AWS trusts the OIDC token
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          # Session duration in seconds (1 hour max for OIDC)
+          role-duration-seconds: 3600
+
+      # -----------------------------------------------------------------------
+      # Step 2.3: Login to Amazon ECR
+      # -----------------------------------------------------------------------
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # -----------------------------------------------------------------------
+      # Step 2.4: Extract metadata for Docker image tags
+      # -----------------------------------------------------------------------
+      # Generates semantic tags based on git context
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}
+          tags: |
+            # Tag with commit SHA (immutable, for rollbacks)
+            # Use full SHA with no prefix so it matches ${{ github.sha }}
+            type=sha,prefix=,format=long
+            # Tag with branch name (e.g., main)
+            type=ref,event=branch
+            # Tag with 'latest' for main branch
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            # Tag with timestamp for auditability
+            type=raw,value={{date 'YYYYMMDD-HHmmss'}}
+
+      # -----------------------------------------------------------------------
+      # Step 2.5: Set up Docker Buildx for advanced features
+      # -----------------------------------------------------------------------
+      # Enables build cache, multi-platform builds, etc.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # -----------------------------------------------------------------------
+      # Step 2.6: Build and push Docker image
+      # -----------------------------------------------------------------------
+      - name: Build and push Docker image
+        id: build-image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: server/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Cache layers in GitHub Actions cache
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # Build arguments for traceability
+          build-args: |
+            BUILD_DATE=${{ github.event.head_commit.timestamp }}
+            GIT_SHA=${{ github.sha }}
+            GIT_REF=${{ github.ref }}
+
+      # -----------------------------------------------------------------------
+      # Step 2.7: Output image URI for downstream jobs
+      # -----------------------------------------------------------------------
+      - name: Output image URI
+        id: output-image
+        run: |
+          # Use SHA-tagged image for deployment (immutable)
+          IMAGE="${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}"
+          echo "image=$IMAGE" >> $GITHUB_OUTPUT
+          echo "📦 Built image: $IMAGE"
+
+      # -----------------------------------------------------------------------
+      # Step 2.8: Scan image for vulnerabilities (optional but recommended)
+      # -----------------------------------------------------------------------
+      - name: Scan image for vulnerabilities
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+          # Security: Block deployment if CRITICAL or HIGH vulnerabilities found
+          exit-code: '1'
+
+      - name: Upload Trivy scan results
+        uses: github/codeql-action/upload-sarif@v4
+        if: always()
+        continue-on-error: true  # Don't fail if code scanning is not enabled
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+  # ===========================================================================
+  # JOB 3: RUN PRISMA MIGRATIONS
+  # ===========================================================================
+  # Runs database migrations before deploying new code.
+  # Uses a one-off ECS task to run migrations from within the VPC.
+  #
+  # ⚠️ IMPORTANT: Migrations run BEFORE new code deploys.
+  # Ensure migrations are backward-compatible with current running code.
+  # ===========================================================================
+  run-migrations:
+    name: 🗄️ Run Migrations
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    # Skip if explicitly requested or on manual dispatch with skip flag
+    if: |
+      github.event_name != 'workflow_dispatch' ||
+      github.event.inputs.skip_migrations != 'true'
+    timeout-minutes: 10
+    # environment: production  # Uncomment after creating GitHub Environment
+
+    steps:
+      # -----------------------------------------------------------------------
+      # Step 3.1: Configure AWS credentials
+      # -----------------------------------------------------------------------
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # -----------------------------------------------------------------------
+      # Step 3.2: Checkout code to get task definition file
+      # -----------------------------------------------------------------------
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      # Step 3.3: Run migrations via ECS run-task using NEW image
+      # -----------------------------------------------------------------------
+      # This runs a one-off container that executes `npx prisma migrate deploy`
+      # using the freshly built Docker image (from build-and-push), inside the
+      # same VPC/network as the ECS service. No public DB access is required.
+      - name: Run Prisma migrations
+        id: migrate
+        run: |
+          echo "🗄️ Running Prisma migrations with latest image..."
+
+          IMAGE="${{ needs.build-and-push.outputs.image }}"
+          echo "Using image: $IMAGE"
+
+          # Ensure jq is available for JSON manipulation
+          if ! command -v jq >/dev/null 2>&1; then
+            echo "Installing jq..."
+            sudo apt-get update -y >/dev/null
+            sudo apt-get install -y jq >/dev/null
+          fi
+
+          # Get network configuration from the service (so migrations run inside the VPC)
+          NETWORK_CONFIG=$(aws ecs describe-services \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services ${{ env.ECS_SERVICE }} \
+            --query 'services[0].networkConfiguration' \
+            --output json)
+
+          # Use the task definition from the REPO FILE (with correct secret ARNs)
+          echo "Using task definition from repo: ${{ env.ECS_TASK_DEFINITION }}"
+          
+          # Update container image in the repo's task definition
+          jq --arg IMAGE "$IMAGE" '
+            .containerDefinitions |= map(
+              if .name == "secure-auth-server" then .image = $IMAGE else . end
+            )
+          ' ${{ env.ECS_TASK_DEFINITION }} > task-def-migrations.json
+
+          # Register the task definition for migrations
+          MIGRATION_TASK_DEF_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://task-def-migrations.json \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+
+          echo "Registered migration task definition: $MIGRATION_TASK_DEF_ARN"
+
+          # Run one-off migration task with overridden command
+          # Note: We use node with prisma directly since npm/npx were removed for security
+          TASK_ARN=$(aws ecs run-task \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --task-definition "$MIGRATION_TASK_DEF_ARN" \
+            --launch-type FARGATE \
+            --network-configuration "$NETWORK_CONFIG" \
+            --overrides '{
+              "containerOverrides": [{
+                "name": "secure-auth-server",
+                "command": ["node", "node_modules/prisma/build/index.js", "migrate", "deploy"]
+              }]
+            }' \
+            --query 'tasks[0].taskArn' \
+            --output text)
+
+          echo "Started migration task: $TASK_ARN"
+
+          # Wait for task to complete (max 5 minutes)
+          echo "Waiting for migration to complete..."
+          aws ecs wait tasks-stopped \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --tasks $TASK_ARN
+
+          # Check exit code
+          EXIT_CODE=$(aws ecs describe-tasks \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --tasks $TASK_ARN \
+            --query 'tasks[0].containers[0].exitCode' \
+            --output text)
+
+          if [ "$EXIT_CODE" != "0" ]; then
+            echo "❌ Migration failed with exit code: $EXIT_CODE"
+            echo "Check CloudWatch logs for details"
+            exit 1
+          fi
+
+          echo "✅ Migrations completed successfully"
+
+  # ===========================================================================
+  # JOB 4: DEPLOY TO ECS FARGATE
+  # ===========================================================================
+  # Updates the ECS service with the new task definition.
+  # Waits for service stability before completing.
+  #
+  # ⚠️ ROLLBACK: If deployment fails, ECS automatically rolls back.
+  # Manual rollback: aws ecs update-service --force-new-deployment
+  # ===========================================================================
+  deploy-ecs:
+    name: 🚀 Deploy to ECS
+    runs-on: ubuntu-latest
+    needs: [build-and-push, run-migrations]
+    # Run even if migrations were skipped (using always() with condition)
+    if: |
+      always() &&
+      needs.build-and-push.result == 'success' &&
+      (needs.run-migrations.result == 'success' || needs.run-migrations.result == 'skipped')
+    timeout-minutes: 15
+    # environment: production  # Uncomment after creating GitHub Environment
+
+    steps:
+      # -----------------------------------------------------------------------
+      # Step 4.1: Checkout code (for task definition file)
+      # -----------------------------------------------------------------------
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      # Step 4.2: Configure AWS credentials
+      # -----------------------------------------------------------------------
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # -----------------------------------------------------------------------
+      # Step 4.3: Save current task definition for rollback
+      # -----------------------------------------------------------------------
+      - name: Save current task definition for rollback
+        id: current-task
+        run: |
+          CURRENT_TASK_DEF=$(aws ecs describe-services \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services ${{ env.ECS_SERVICE }} \
+            --query 'services[0].taskDefinition' \
+            --output text)
+          echo "current_task_def=$CURRENT_TASK_DEF" >> $GITHUB_OUTPUT
+          echo "📋 Current task definition: $CURRENT_TASK_DEF"
+
+      # -----------------------------------------------------------------------
+      # Step 4.4: Substitute variables in task definition
+      # -----------------------------------------------------------------------
+      - name: Substitute variables in task definition
+        run: |
+          # Replace placeholder variables with actual values
+          sed -i 's|\${AWS_ACCOUNT_ID}|${{ secrets.AWS_ACCOUNT_ID }}|g' ${{ env.ECS_TASK_DEFINITION }}
+          sed -i 's|\${AWS_REGION}|${{ env.AWS_REGION }}|g' ${{ env.ECS_TASK_DEFINITION }}
+          
+          echo "📝 Task definition prepared"
+
+      # -----------------------------------------------------------------------
+      # Step 4.5: Render new task definition with updated image
+      # -----------------------------------------------------------------------
+      - name: Render new task definition
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: ${{ env.ECS_TASK_DEFINITION }}
+          container-name: secure-auth-server
+          image: ${{ needs.build-and-push.outputs.image }}
+
+      # -----------------------------------------------------------------------
+      # Step 4.6: Deploy to ECS
+      # -----------------------------------------------------------------------
+      # wait-for-service-stability ensures the deployment is healthy
+      # before marking the job as successful
+      - name: Deploy to Amazon ECS
+        id: deploy
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          # Wait up to 10 minutes for tasks to become healthy
+          wait-for-service-stability: true
+
+      # -----------------------------------------------------------------------
+      # Step 4.7: Verify deployment health
+      # -----------------------------------------------------------------------
+      - name: Verify deployment health
+        run: |
+          echo "🔍 Verifying deployment..."
+          
+          # Get ALB DNS name (assumes you have it tagged or known)
+          # For now, check ECS service health
+          RUNNING_COUNT=$(aws ecs describe-services \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services ${{ env.ECS_SERVICE }} \
+            --query 'services[0].runningCount' \
+            --output text)
+          
+          DESIRED_COUNT=$(aws ecs describe-services \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services ${{ env.ECS_SERVICE }} \
+            --query 'services[0].desiredCount' \
+            --output text)
+          
+          echo "Running: $RUNNING_COUNT / Desired: $DESIRED_COUNT"
+          
+          if [ "$RUNNING_COUNT" != "$DESIRED_COUNT" ]; then
+            echo "⚠️ Warning: Running count does not match desired count"
+          else
+            echo "✅ Deployment verified: $RUNNING_COUNT tasks running"
+          fi
+
+      # -----------------------------------------------------------------------
+      # Step 4.8: Output deployment summary
+      # -----------------------------------------------------------------------
+      - name: Deployment summary
+        if: success()
+        run: |
+          echo "============================================="
+          echo "✅ DEPLOYMENT SUCCESSFUL"
+          echo "============================================="
+          echo "Image: ${{ needs.build-and-push.outputs.image }}"
+          echo "Cluster: ${{ env.ECS_CLUSTER }}"
+          echo "Service: ${{ env.ECS_SERVICE }}"
+          echo "Time: $(date -u +"%Y-%m-%d %H:%M:%S UTC")"
+          echo "============================================="
+
+      # -----------------------------------------------------------------------
+      # Step 4.9: Rollback instructions on failure
+      # -----------------------------------------------------------------------
+      - name: Rollback instructions
+        if: failure()
+        run: |
+          echo "============================================="
+          echo "❌ DEPLOYMENT FAILED"
+          echo "============================================="
+          echo ""
+          echo "To rollback to previous version, run:"
+          echo ""
+          echo "  aws ecs update-service \\"
+          echo "    --cluster ${{ env.ECS_CLUSTER }} \\"
+          echo "    --service ${{ env.ECS_SERVICE }} \\"
+          echo "    --task-definition ${{ steps.current-task.outputs.current_task_def }} \\"
+          echo "    --force-new-deployment"
+          echo ""
+          echo "Previous task definition:"
+          echo "  ${{ steps.current-task.outputs.current_task_def }}"
+          echo ""
+          echo "============================================="
+
+  # ===========================================================================
+  # JOB 5: NOTIFY
+  # ===========================================================================
+  # Logs deployment status to GitHub Actions.
+  # ===========================================================================
+  notify:
+    name: 📣 Notify
+    runs-on: ubuntu-latest
+    needs: [quality-gates, build-and-push, deploy-ecs]
+    if: always()
+    timeout-minutes: 5
+
+    steps:
+      # -----------------------------------------------------------------------
+      # Step 6.1: Determine overall status
+      # -----------------------------------------------------------------------
+      - name: Determine status
+        id: status
+        run: |
+          if [ "${{ needs.deploy-ecs.result }}" == "success" ]; then
+            echo "status=success" >> $GITHUB_OUTPUT
+            echo "emoji=✅" >> $GITHUB_OUTPUT
+            echo "message=Deployment successful" >> $GITHUB_OUTPUT
+          elif [ "${{ needs.deploy-ecs.result }}" == "failure" ]; then
+            echo "status=failure" >> $GITHUB_OUTPUT
+            echo "emoji=❌" >> $GITHUB_OUTPUT
+            echo "message=Deployment failed" >> $GITHUB_OUTPUT
+          elif [ "${{ needs.quality-gates.result }}" == "failure" ]; then
+            echo "status=failure" >> $GITHUB_OUTPUT
+            echo "emoji=🔴" >> $GITHUB_OUTPUT
+            echo "message=Quality gates failed" >> $GITHUB_OUTPUT
+          else
+            echo "status=skipped" >> $GITHUB_OUTPUT
+            echo "emoji=⏭️" >> $GITHUB_OUTPUT
+            echo "message=Deployment skipped" >> $GITHUB_OUTPUT
+          fi
+
+      # -----------------------------------------------------------------------
+      # Step 6.2: Create GitHub deployment status
+      # -----------------------------------------------------------------------
+      - name: Create deployment status
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const status = '${{ steps.status.outputs.status }}';
+            const emoji = '${{ steps.status.outputs.emoji }}';
+            const message = '${{ steps.status.outputs.message }}';
+            
+            console.log(`${emoji} ${message}`);
+            console.log(`Commit: ${{ github.sha }}`);
+            console.log(`Workflow: ${{ github.run_id }}`);
+
+# =============================================================================
+# NOTES AND WARNINGS
+# =============================================================================
+#
+# ⚠️ POTENTIAL RACE CONDITIONS:
+# 1. Concurrent deployments: Mitigated by concurrency group (one at a time)
+# 2. Migration vs deployment: Migrations run BEFORE deploy; ensure backward-compat
+# 3. Amplify vs ECS: They deploy in parallel; ensure client handles API versioning
+#
+# ⚠️ AWS LIMITS TO WATCH:
+# 1. ECR: 10,000 images per repository (lifecycle policy cleans up old images)
+# 2. ECS: 5,000 tasks per cluster (unlikely to hit)
+# 3. Secrets Manager: 500,000 secrets per account (not a concern)
+# 4. CloudWatch Logs: 5 requests/sec for PutLogEvents (batched by ECS agent)
+#
+# ⚠️ DEPENDENCY ISSUES:
+# 1. @secure-auth/schemas must be built before server can compile
+# 2. Prisma Client must be generated inside Docker (platform-specific)
+# 3. Node version in workflow must match Dockerfile
+#
+# ⚠️ ROLLBACK PROCEDURE:
+# 1. Find previous task definition: aws ecs list-task-definitions
+# 2. Update service: aws ecs update-service --task-definition <arn> --force-new-deployment
+# 3. Or revert git commit and push (triggers new deployment)
+#
+# =============================================================================

@@ -1,0 +1,117 @@
+{
+  "family": "secure-auth-server",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "512",
+  "memory": "1024",
+  "executionRoleArn": "arn:aws:iam::959431853794:role/ecsTaskExecutionRole",
+  "taskRoleArn": "arn:aws:iam::959431853794:role/secure-auth-task-role",
+  "containerDefinitions": [
+    {
+      "name": "secure-auth-server",
+      "image": "959431853794.dkr.ecr.eu-north-1.amazonaws.com/secure-auth-server:latest",
+      "essential": true,
+      "portMappings": [
+        {
+          "containerPort": 4000,
+          "hostPort": 4000,
+          "protocol": "tcp"
+        }
+      ],
+      "environment": [
+        { "name": "NODE_ENV", "value": "production" },
+        { "name": "PORT", "value": "4000" }
+      ],
+      "secrets": [
+        {
+          "name": "DATABASE_URL",
+          "valueFrom": "arn:aws:secretsmanager:eu-north-1:959431853794:secret:secure-auth/database-url-TzqH5Z"
+        },
+        {
+          "name": "DIRECT_URL",
+          "valueFrom": "arn:aws:secretsmanager:eu-north-1:959431853794:secret:secure-auth/direct-url-RvqcJD"
+        },
+        {
+          "name": "SUPABASE_URL",
+          "valueFrom": "arn:aws:secretsmanager:eu-north-1:959431853794:secret:secure-auth/supabase-url-LVTbQv"
+        },
+        {
+          "name": "SUPABASE_ANON_KEY",
+          "valueFrom": "arn:aws:secretsmanager:eu-north-1:959431853794:secret:secure-auth/supabase-anon-key-6scfpV"
+        },
+        {
+          "name": "SUPABASE_SERVICE_ROLE_KEY",
+          "valueFrom": "arn:aws:secretsmanager:eu-north-1:959431853794:secret:secure-auth/supabase-service-role-key-OnSFWE"
+        },
+        {
+          "name": "FRONTEND_URL",
+          "valueFrom": "arn:aws:secretsmanager:eu-north-1:959431853794:secret:secure-auth/frontend-url-5Ylug3"
+        },
+        {
+          "name": "CSRF_SECRET",
+          "valueFrom": "arn:aws:secretsmanager:eu-north-1:959431853794:secret:secure-auth/csrf-secret-Ku4HXf"
+        },
+        {
+          "name": "REDIS_URL",
+          "valueFrom": "arn:aws:secretsmanager:eu-north-1:959431853794:secret:secure-auth/redis-url-NcCjds"
+        },
+        {
+          "name": "SENTRY_DSN",
+          "valueFrom": "arn:aws:secretsmanager:eu-north-1:959431853794:secret:secure-auth/sentry-dsn-OZjkhA"
+        }
+      ],
+      "healthCheck": {
+        "command": [
+          "CMD-SHELL",
+          "wget --no-verbose --tries=1 --spider http://localhost:4000/health || exit 1"
+        ],
+        "interval": 30,
+        "timeout": 10,
+        "retries": 3,
+        "startPeriod": 60
+      },
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/secure-auth-server",
+          "awslogs-region": "eu-north-1",
+          "awslogs-stream-prefix": "ecs",
+          "awslogs-create-group": "true"
+        }
+      },
+      "readonlyRootFilesystem": true,
+      "privileged": false,
+      "linuxParameters": {
+        "initProcessEnabled": true,
+        "capabilities": {
+          "drop": ["ALL"]
+        }
+      },
+      "ulimits": [
+        {
+          "name": "nofile",
+          "softLimit": 65536,
+          "hardLimit": 65536
+        }
+      ],
+      "mountPoints": [
+        {
+          "sourceVolume": "tmp",
+          "containerPath": "/tmp",
+          "readOnly": false
+        }
+      ]
+    }
+  ],
+  "volumes": [
+    {
+      "name": "tmp",
+      "host": {}
+    }
+  ],
+  "tags": [
+    { "key": "Project", "value": "secure-auth" },
+    { "key": "Environment", "value": "production" },
+    { "key": "SecurityAudit", "value": "2025-12" }
+  ]
+}

@@ -1,0 +1,90 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ECRLogin",
+      "Effect": "Allow",
+      "Action": ["ecr:GetAuthorizationToken"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "ECRPushPull",
+      "Effect": "Allow",
+      "Action": [
+        "ecr:BatchCheckLayerAvailability",
+        "ecr:GetDownloadUrlForLayer",
+        "ecr:BatchGetImage",
+        "ecr:PutImage",
+        "ecr:InitiateLayerUpload",
+        "ecr:UploadLayerPart",
+        "ecr:CompleteLayerUpload"
+      ],
+      "Resource": "arn:aws:ecr:${AWS_REGION}:${AWS_ACCOUNT_ID}:repository/secure-auth-server"
+    },
+    {
+      "Sid": "ECSDescribe",
+      "Effect": "Allow",
+      "Action": [
+        "ecs:DescribeServices",
+        "ecs:DescribeTaskDefinition",
+        "ecs:DescribeTasks",
+        "ecs:ListTasks"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "ecs:cluster": "arn:aws:ecs:${AWS_REGION}:${AWS_ACCOUNT_ID}:cluster/secure-auth-cluster"
+        }
+      }
+    },
+    {
+      "Sid": "ECSRegisterTaskDefinition",
+      "Effect": "Allow",
+      "Action": ["ecs:RegisterTaskDefinition"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "ECSUpdateService",
+      "Effect": "Allow",
+      "Action": ["ecs:UpdateService"],
+      "Resource": "arn:aws:ecs:${AWS_REGION}:${AWS_ACCOUNT_ID}:service/secure-auth-cluster/secure-auth-service"
+    },
+    {
+      "Sid": "ECSRunTask",
+      "Effect": "Allow",
+      "Action": ["ecs:RunTask"],
+      "Resource": "arn:aws:ecs:${AWS_REGION}:${AWS_ACCOUNT_ID}:task-definition/secure-auth-server:*",
+      "Condition": {
+        "StringEquals": {
+          "ecs:cluster": "arn:aws:ecs:${AWS_REGION}:${AWS_ACCOUNT_ID}:cluster/secure-auth-cluster"
+        }
+      }
+    },
+    {
+      "Sid": "ECSDescribeCluster",
+      "Effect": "Allow",
+      "Action": ["ecs:DescribeClusters"],
+      "Resource": "arn:aws:ecs:${AWS_REGION}:${AWS_ACCOUNT_ID}:cluster/secure-auth-cluster"
+    },
+    {
+      "Sid": "PassRoleToECS",
+      "Effect": "Allow",
+      "Action": ["iam:PassRole"],
+      "Resource": [
+        "arn:aws:iam::${AWS_ACCOUNT_ID}:role/ecsTaskExecutionRole",
+        "arn:aws:iam::${AWS_ACCOUNT_ID}:role/secure-auth-task-role"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "iam:PassedToService": "ecs-tasks.amazonaws.com"
+        }
+      }
+    },
+    {
+      "Sid": "AmplifyStartJob",
+      "Effect": "Allow",
+      "Action": ["amplify:StartJob"],
+      "Resource": "arn:aws:amplify:${AWS_REGION}:${AWS_ACCOUNT_ID}:apps/*/branches/main/jobs/*"
+    }
+  ]
+}
