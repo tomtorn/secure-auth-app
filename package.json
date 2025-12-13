@@ -1,0 +1,45 @@
+{
+  "name": "secure-auth",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": [
+    "packages/*",
+    "server",
+    "client"
+  ],
+  "scripts": {
+    "dev": "npm run dev:server & npm run dev:client",
+    "dev:server": "npm run dev --workspace=server",
+    "dev:client": "npm run dev --workspace=client",
+    "build": "npm run build --workspaces",
+    "lint": "npm run lint --workspaces --if-present",
+    "format": "prettier --check \"**/*.{ts,tsx,js,jsx,json,md,css}\"",
+    "format:fix": "prettier --write \"**/*.{ts,tsx,js,jsx,json,md,css}\"",
+    "prepare": "if [ \"$HUSKY\" != \"0\" ] && command -v husky >/dev/null 2>&1; then husky install; fi",
+    "db:push": "npm run db:push --workspace=server",
+    "db:migrate": "npm run db:migrate --workspace=server",
+    "db:migrate:deploy": "npm run db:migrate:deploy --workspace=server",
+    "db:studio": "npm run db:studio --workspace=server",
+    "docker:build": "docker build -f server/Dockerfile -t secure-auth-server .",
+    "docker:run": "docker run --rm -p 4000:4000 --env-file server/.env secure-auth-server",
+    "docker:tag": "docker tag secure-auth-server:latest ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/secure-auth-server:latest",
+    "docker:push": "docker push ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/secure-auth-server:latest"
+  },
+  "devDependencies": {
+    "husky": "^9.0.0",
+    "lint-staged": "^15.2.0",
+    "prettier": "^3.2.5"
+  },
+  "lint-staged": {
+    "*.{ts,tsx,js,jsx}": [
+      "prettier --write"
+    ],
+    "*.{json,md,css,scss}": [
+      "prettier --write"
+    ]
+  },
+  "overrides": {
+    "cross-spawn": "^7.0.5",
+    "glob": "^10.5.0"
+  }
+}
