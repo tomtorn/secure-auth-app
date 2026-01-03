@@ -72,6 +72,10 @@ RUN npx prisma generate
 # Copy built application from builder stage
 COPY --from=builder /app/server/dist ./dist
 
+# Copy Prisma CLI from builder for migrations (prisma is a devDependency)
+COPY --from=builder /app/node_modules/prisma ./node_modules/prisma
+COPY --from=builder /app/node_modules/@prisma/engines ./node_modules/@prisma/engines
+
 # Security: Remove npm and npx from production image (not needed at runtime)
 # This eliminates vulnerabilities in npm's bundled dependencies
 RUN rm -rf /usr/local/lib/node_modules/npm /usr/local/bin/npm /usr/local/bin/npx
