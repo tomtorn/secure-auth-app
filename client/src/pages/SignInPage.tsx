@@ -28,7 +28,9 @@ export const SignInPage = (): JSX.Element => {
 
     if (confirmed === 'true') {
       setSuccessMessage('Email confirmed! Please sign in.');
-      if (email) {
+      // SECURITY: Validate email format before setting to prevent phishing attacks
+      // Only set if it looks like a valid email address
+      if (email && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
         setValue('email', email);
       }
       // Clean up URL

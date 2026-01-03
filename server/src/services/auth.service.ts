@@ -3,6 +3,7 @@ import { authSessionSchema, userSchema } from '../schemas/index.js';
 import { prisma } from '../lib/prisma.js';
 import { supabase, supabaseAdmin } from '../lib/supabase.js';
 import { logger } from '../lib/logger.js';
+import { reportEvent, reportSecurityEvent, SecurityEvents } from '../lib/monitoring.js';
 import { USER_SELECT } from '../lib/constants.js';
 import { AppError, UnauthorizedError } from './errors.js';
 import { config } from '../config/index.js';
@@ -127,6 +128,11 @@ const signIn = async ({ email, password }: SignInInput): Promise<AuthSession> =>
   if (error) {
     // Log actual error for debugging (server-side only)
     logger.error({ error: error.message }, 'Sign in failed');
+    // Report failed auth attempt to monitoring
+    reportSecurityEvent(SecurityEvents.AUTH_FAILED, {
+      email,
+      reason: error.message,
+    });
     // Return generic message
     throw new UnauthorizedError('Invalid credentials');
   }
@@ -139,6 +145,13 @@ const signIn = async ({ email, password }: SignInInput): Promise<AuthSession> =>
 
   try {
     const dbUser = await syncUser(data.user);
+
+    // Report successful login event
+    reportEvent({
+      name: 'auth.signin_success',
+      data: { email, userId: dbUser.id },
+      level: 'info',
+    });
 
     return authSessionSchema.parse({
       user: userSchema.parse(dbUser),

@@ -1,6 +1,7 @@
 import type { Request, Response, NextFunction } from 'express';
 import { authService } from '../services/auth.service.js';
 import { logger } from '../lib/logger.js';
+import { setMonitoringUser } from '../lib/monitoring.js';
 import type { User } from '../schemas/index.js';
 import { TOKEN_COOKIE } from '../lib/constants.js';
 
@@ -30,6 +31,7 @@ export const requireAuth = async (
     }
 
     (req as AuthRequest).user = user;
+    setMonitoringUser({ id: user.id, email: user.email });
     next();
   } catch (error) {
     logger.error({ err: error }, 'Auth middleware: token validation failed');

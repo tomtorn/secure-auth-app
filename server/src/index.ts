@@ -63,6 +63,10 @@ app.use(
   }),
 );
 
+// SECURITY: Webhook routes need raw body for HMAC signature verification
+// Must be registered BEFORE express.json() middleware
+app.use('/api/webhooks', express.raw({ type: 'application/json', limit: '10kb' }));
+
 // Body parsing with size limit to prevent DoS
 app.use(express.json({ limit: '10kb' }));
 app.use(cookieParser());

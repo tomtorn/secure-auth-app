@@ -2,6 +2,7 @@ import type { Request, Response, NextFunction } from 'express';
 import { config } from '../config/index.js';
 import { incrementRateLimit } from '../lib/redis.js';
 import { logger } from '../lib/logger.js';
+import { reportSecurityEvent, SecurityEvents } from '../lib/monitoring.js';
 
 /**
  * Rate limiting middleware.
@@ -82,10 +83,28 @@ const createRateLimiter = (options: RateLimitOptions) => {
 
         if (count > maxRequests) {
           logger.warn({ ip, path: req.path, count }, 'Rate limit exceeded (Redis)');
+          reportSecurityEvent(SecurityEvents.RATE_LIMIT_EXCEEDED, {
+            ip,
+            path: req.path,
+            count,
+            reason: 'Redis rate limit exceeded',
+          });
           res.setHeader('Retry-After', String(windowSeconds));
-          res.status(429).json({ success: false, error: 'Too many requests' });
+          res.setHeader('X-RateLimit-Limit', String(maxRequests));
+          res.setHeader('X-RateLimit-Remaining', '0');
+          res.status(429).json({
+            success: false,
+            error: 'Too many requests',
+            retryAfter: windowSeconds,
+            limit: maxRequests,
+            remaining: 0,
+          });
           return;
         }
+
+        // Add rate limit headers for successful requests
+        res.setHeader('X-RateLimit-Limit', String(maxRequests));
+        res.setHeader('X-RateLimit-Remaining', String(Math.max(0, maxRequests - count)));
 
         next();
         return;
@@ -97,11 +116,30 @@ const createRateLimiter = (options: RateLimitOptions) => {
     const result = inMemoryRateLimit(key, windowMs, maxRequests);
 
     if (!result.allowed) {
+      const retryAfter = Math.ceil(result.resetIn / 1000);
       logger.warn({ ip, path: req.path, count: result.count }, 'Rate limit exceeded (in-memory)');
-      res.setHeader('Retry-After', String(Math.ceil(result.resetIn / 1000)));
-      res.status(429).json({ success: false, error: 'Too many requests' });
+      reportSecurityEvent(SecurityEvents.RATE_LIMIT_EXCEEDED, {
+        ip,
+        path: req.path,
+        count: result.count,
+        reason: 'In-memory rate limit exceeded',
+      });
+      res.setHeader('Retry-After', String(retryAfter));
+      res.setHeader('X-RateLimit-Limit', String(maxRequests));
+      res.setHeader('X-RateLimit-Remaining', '0');
+      res.status(429).json({
+        success: false,
+        error: 'Too many requests',
+        retryAfter,
+        limit: maxRequests,
+        remaining: 0,
+      });
       return;
     }
+
+    // Add rate limit headers for successful requests
+    res.setHeader('X-RateLimit-Limit', String(maxRequests));
+    res.setHeader('X-RateLimit-Remaining', String(Math.max(0, maxRequests - result.count)));
 
     next();
   };

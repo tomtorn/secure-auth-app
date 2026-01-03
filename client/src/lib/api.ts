@@ -1,3 +1,5 @@
+import { z } from 'zod';
+import { userSchema, apiSuccessSchema, apiErrorSchema } from './schemas';
 import type { User, SignInInput, SignUpInput } from './schemas';
 import { CSRF_COOKIE, CSRF_HEADER } from './constants';
 
@@ -219,8 +221,12 @@ export const fetcher = async <T>(endpoint: string, options?: FetcherOptions): Pr
         throw new Error(err.error || `HTTP ${response.status}`);
       }
 
-      const result = (await response.json()) as ApiResponse<T>;
-      return result.data;
+      const json = (await response.json()) as ApiResponse<T> | ApiErrorResponse;
+      // SECURITY: Runtime validation of API responses to catch malformed data
+      if (!json.success) {
+        throw new Error((json as ApiErrorResponse).error || 'Request failed');
+      }
+      return json.data;
     } catch (error) {
       clearTimeout(timeoutId);
 
@@ -249,18 +255,43 @@ export const fetcher = async <T>(endpoint: string, options?: FetcherOptions): Pr
   throw lastError;
 };
 
+// User response schema for runtime validation
+const userResponseSchema = apiSuccessSchema(userSchema);
+
 // Auth API
 export const signIn = async (data: SignInInput): Promise<User> => {
   // Ensure we have a CSRF token before signing in
   // Use ensureCsrfToken to avoid race condition with cookie reading
   const csrfToken = await ensureCsrfToken();
 
-  return fetcher<User>('/api/auth/signin', {
-    method: 'POST',
-    body: JSON.stringify(data),
-    headers: { [CSRF_HEADER]: csrfToken },
-    retries: 0, // No retries for auth - fail fast on wrong credentials
-  });
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), DEFAULT_TIMEOUT);
+
+  try {
+    const response = await fetch(`${API_URL}/api/auth/signin`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        [CSRF_HEADER]: csrfToken,
+      },
+      credentials: 'include',
+      body: JSON.stringify(data),
+      signal: controller.signal,
+    });
+
+    const json = await response.json();
+
+    if (!response.ok) {
+      const errorResult = apiErrorSchema.safeParse(json);
+      throw new Error(errorResult.success ? errorResult.data.error : `HTTP ${response.status}`);
+    }
+
+    // SECURITY: Runtime validation of user data from server
+    const result = userResponseSchema.parse(json);
+    return result.data;
+  } finally {
+    clearTimeout(timeoutId);
+  }
 };
 
 // Signup response type - either user or email confirmation required
@@ -268,46 +299,73 @@ export type SignUpResponse =
   | { emailConfirmationRequired: true; message: string; user: null }
   | { emailConfirmationRequired: false; user: User };
 
+// SignUp response schema for runtime validation
+const signUpResponseSchema = z.union([
+  z.object({
+    success: z.literal(true),
+    data: userSchema,
+    emailConfirmationRequired: z.literal(false).optional(),
+  }),
+  z.object({
+    success: z.literal(true),
+    data: z.null(),
+    emailConfirmationRequired: z.literal(true),
+    message: z.string().optional(),
+  }),
+]);
+
 export const signUp = async (data: SignUpInput): Promise<SignUpResponse> => {
-  // Ensure we have a CSRF token before signing up
   const csrfToken = await ensureCsrfToken();
 
-  const url = `${API_URL}/api/auth/signup`;
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), DEFAULT_TIMEOUT);
 
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      [CSRF_HEADER]: csrfToken,
-    },
-    credentials: 'include',
-    body: JSON.stringify(data),
-  });
+  try {
+    const response = await fetch(`${API_URL}/api/auth/signup`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        [CSRF_HEADER]: csrfToken,
+      },
+      credentials: 'include',
+      body: JSON.stringify(data),
+      signal: controller.signal,
+    });
 
-  const result = (await response.json()) as {
-    success: boolean;
-    data: User | null;
-    emailConfirmationRequired?: boolean;
-    message?: string;
-    error?: string;
-  };
+    const json = await response.json();
 
-  if (!response.ok) {
-    throw new Error(result.error ?? `HTTP ${response.status}`);
-  }
+    if (!response.ok) {
+      const errorResult = apiErrorSchema.safeParse(json);
+      throw new Error(errorResult.success ? errorResult.data.error : `HTTP ${response.status}`);
+    }
 
-  if (result.emailConfirmationRequired) {
+    // SECURITY: Runtime validation of signup response
+    const result = signUpResponseSchema.parse(json);
+
+    if (result.emailConfirmationRequired) {
+      return {
+        emailConfirmationRequired: true,
+        message: result.message ?? 'Please check your email to confirm your account.',
+        user: null,
+      };
+    }
+
     return {
-      emailConfirmationRequired: true,
-      message: result.message ?? 'Please check your email to confirm your account.',
-      user: null,
+      emailConfirmationRequired: false,
+      user: result.data,
     };
+  } catch (err) {
+    if (err instanceof Error && err.name === 'AbortError') {
+      throw new Error('Request timed out');
+    }
+    if (err instanceof z.ZodError) {
+      console.error('API response validation failed:', err.errors);
+      throw new Error('Invalid response from server');
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeoutId);
   }
-
-  return {
-    emailConfirmationRequired: false,
-    user: result.data as User,
-  };
 };
 
 // signOut returns { success: true, data: null } from server
@@ -324,19 +382,44 @@ export const signOut = (): Promise<null> =>
 /**
  * Check if user is authenticated.
  * Returns null if not logged in (401) instead of throwing.
+ * SECURITY: Validates response with Zod schema.
  */
 export const getCurrentUser = async (): Promise<User | null> => {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), DEFAULT_TIMEOUT);
+
   try {
-    return await fetcher<User>('/api/auth/me', { retries: 0 });
+    const response = await fetch(`${API_URL}/api/auth/me`, {
+      method: 'GET',
+      credentials: 'include',
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      // 401/Unauthorized is expected when not logged in - return null silently
+      if (response.status === 401) {
+        return null;
+      }
+      throw new Error(`HTTP ${response.status}`);
+    }
+
+    const json = await response.json();
+    // SECURITY: Runtime validation of user data from server
+    const result = userResponseSchema.parse(json);
+    return result.data;
   } catch (err) {
-    // 401/Unauthorized is expected when not logged in - return null silently
-    if (
-      err instanceof Error &&
-      (err.message.includes('401') || err.message.toLowerCase().includes('unauthorized'))
-    ) {
-      return null;
+    // Handle abort/timeout
+    if (err instanceof Error && err.name === 'AbortError') {
+      throw new Error('Request timed out');
+    }
+    // Handle Zod validation errors gracefully
+    if (err instanceof z.ZodError) {
+      console.error('API response validation failed:', err.errors);
+      throw new Error('Invalid response from server');
     }
     throw err;
+  } finally {
+    clearTimeout(timeoutId);
   }
 };
 

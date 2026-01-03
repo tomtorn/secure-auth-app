@@ -1,6 +1,6 @@
 import { prisma } from '../lib/prisma.js';
 import type { GetUsersQuery, UpdateUserInput, User } from '../schemas/index.js';
-import { NotFoundError } from './errors.js';
+import { NotFoundError, ValidationError } from './errors.js';
 import { USER_SELECT } from '../lib/constants.js';
 import { syncService } from './sync.service.js';
 
@@ -70,6 +70,10 @@ const getUserById = async (id: string): Promise<User> => {
 // Direct user creation has been removed to ensure all users have supabaseId.
 
 const updateUser = async (id: string, data: UpdateUserInput): Promise<User> => {
+  // Validate that at least one field is being updated
+  if (!data.name && !data.email) {
+    throw new ValidationError('At least one field must be provided for update');
+  }
   await getUserById(id);
   return prisma.user.update({ where: { id }, data, select: USER_SELECT });
 };

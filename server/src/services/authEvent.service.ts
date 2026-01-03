@@ -75,26 +75,6 @@ export const authEventService = {
     return { signIns, signUps, signInsFailed };
   },
 
-  /**
-   * Get failed login attempts for a specific email within a time window
-   * Used for account lockout protection
-   *
-   * Security: This enables brute-force protection by tracking failed attempts
-   * per account (not just per IP like rate limiting does)
-   *
-   * NOTE: For production scale, consider moving to Redis for:
-   * - Sub-millisecond lookups (vs ~10ms DB query)
-   * - Distributed consistency across multiple ECS tasks
-   * - Auto-expiring keys (no cleanup needed)
-   *
-   * Redis implementation example:
-   * ```typescript
-   * const key = `lockout:${email}`;
-   * const attempts = await redis.incr(key);
-   * if (attempts === 1) await redis.expire(key, windowMinutes * 60);
-   * return attempts;
-   * ```
-   */
   getFailedAttempts: async (email: string, since: Date): Promise<number> => {
     try {
       return await prisma.authEvent.count({

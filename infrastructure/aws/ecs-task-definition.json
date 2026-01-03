@@ -58,6 +58,10 @@
         {
           "name": "SENTRY_DSN",
           "valueFrom": "arn:aws:secretsmanager:eu-north-1:959431853794:secret:secure-auth/sentry-dsn-OZjkhA"
+        },
+        {
+          "name": "SUPABASE_WEBHOOK_SECRET",
+          "valueFrom": "arn:aws:secretsmanager:eu-north-1:959431853794:secret:secure-auth/supabase-webhook-secre-u59u5u"
         }
       ],
       "healthCheck": {

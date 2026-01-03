@@ -4,16 +4,6 @@ import { logger } from '../lib/logger.js';
 import { USER_SELECT } from '../lib/constants.js';
 import type { User } from '../schemas/index.js';
 
-/**
- * SyncService - Handles synchronization between Supabase Auth and RDS.
- *
- * This service ensures data consistency between Supabase (auth provider)
- * and our RDS database (application data). It handles:
- * - Orphan cleanup (users in RDS that don't exist in Supabase)
- * - Email verification status sync
- * - User data reconciliation
- */
-
 export interface CleanupResult {
   deleted: number;
   processed: number;

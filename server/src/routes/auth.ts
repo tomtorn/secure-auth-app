@@ -17,6 +17,7 @@ import {
   getStringCookie,
 } from '../lib/constants.js';
 import { logger } from '../lib/logger.js';
+import { getLockoutCount, incrementLockoutCounter, resetLockoutCounter } from '../lib/redis.js';
 
 export const authRouter = Router();
 
@@ -115,13 +116,18 @@ authRouter.post(
   asyncHandler(async (req: Request, res: Response) => {
     const body = signInSchema.parse(req.body);
 
-    // Security: Account lockout after too many failed attempts
-    const lockoutWindowStart = new Date(Date.now() - LOCKOUT_WINDOW_MINUTES * 60 * 1000);
-    const failedAttempts = await authEventService.getFailedAttempts(body.email, lockoutWindowStart);
+    // SECURITY: Check lockout using Redis atomic counter (prevents TOCTOU race condition)
+    // This replaces the previous DB-based check which had a race condition window
+    const currentLockoutCount = await getLockoutCount(body.email);
 
-    if (failedAttempts >= LOCKOUT_MAX_ATTEMPTS) {
+    if (currentLockoutCount >= LOCKOUT_MAX_ATTEMPTS) {
+      // SECURITY: Add random delay (50-150ms) to prevent email enumeration via timing attacks
+      // Without this, attackers could distinguish locked accounts from non-existent ones
+      const randomDelay = 50 + Math.random() * 100;
+      await new Promise((resolve) => setTimeout(resolve, randomDelay));
+
       logger.warn(
-        { email: body.email, failedAttempts, ip: req.ip ?? 'unknown' },
+        { email: body.email, failedAttempts: currentLockoutCount, ip: req.ip ?? 'unknown' },
         'Account locked due to too many failed attempts',
       );
       res.status(429).json({
@@ -133,6 +139,9 @@ authRouter.post(
 
     try {
       const session = await authService.signIn(body);
+
+      // Reset lockout counter on successful login
+      await resetLockoutCounter(body.email);
 
       // Log successful sign-in (fire-and-forget)
       void authEventService.log({
@@ -146,6 +155,10 @@ authRouter.post(
       setCookies(res, session.accessToken, session.refreshToken, session.expiresIn);
       res.json({ success: true, data: session.user });
     } catch (error) {
+      // SECURITY: Atomically increment lockout counter on failed attempt
+      // This prevents race conditions where multiple concurrent requests could bypass lockout
+      await incrementLockoutCounter(body.email, LOCKOUT_WINDOW_MINUTES);
+
       // Log failed sign-in attempt (fire-and-forget)
       void authEventService.log({
         email: body.email,
@@ -229,19 +242,6 @@ authRouter.get('/csrf', (_req: Request, res: Response) => {
   res.json({ success: true, data: { csrfToken: token } });
 });
 
-/**
- * GET /pending-email - Retrieve and clear pending email for pre-fill after confirmation
- *
- * This endpoint:
- * 1. Reads the pending_email HttpOnly cookie (set during signup)
- * 2. Returns the email to the client
- * 3. Clears the cookie (one-time use)
- *
- * Security:
- * - Cookie is HttpOnly (not accessible via JS directly)
- * - Cookie is cleared after reading (one-time use)
- * - No sensitive data exposed (just email, which user already knows)
- */
 authRouter.get('/pending-email', (req: Request, res: Response) => {
   const pendingEmail = getStringCookie(req.cookies, PENDING_EMAIL_COOKIE);
 

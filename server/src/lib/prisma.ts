@@ -17,24 +17,6 @@ const globalForPrisma = globalThis as unknown as {
 // Prisma Client Factory
 // =============================================================================
 
-/**
- * Creates a configured Prisma Client with:
- * - Query event logging for slow query detection
- * - Error logging
- * - Connection pool settings via DATABASE_URL
- *
- * CONNECTION POOLING:
- * Configure via DATABASE_URL query parameters:
- * - connection_limit=5  (connections per task)
- * - pool_timeout=10     (wait time for connection)
- * - connect_timeout=10  (initial connection timeout)
- *
- * Example:
- * postgresql://user:pass@host:5432/db?connection_limit=5&pool_timeout=10
- *
- * FOR PRODUCTION: Use RDS Proxy for managed connection pooling:
- * postgresql://user:pass@proxy-endpoint.proxy-xxx.rds.amazonaws.com:5432/db
- */
 const createPrismaClient = (): PrismaClient => {
   const client = new PrismaClient({
     log: [

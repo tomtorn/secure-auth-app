@@ -1,33 +1,3 @@
-/**
- * Redis Client for Distributed Rate Limiting and Account Lockout
- *
- * Why Redis for security features?
- * ================================
- * 1. DISTRIBUTED: Works across multiple ECS tasks/K8s pods
- *    - In-memory Maps only work per-process
- *    - Attackers can bypass by hitting different instances
- *
- * 2. FAST: Sub-millisecond lookups (vs ~10ms for DB queries)
- *    - Critical for auth endpoints that need real-time protection
- *
- * 3. AUTO-EXPIRING: Keys expire automatically (TTL)
- *    - No cleanup jobs needed
- *    - Perfect for sliding window rate limiting
- *
- * 4. ATOMIC: INCR + EXPIRE in one operation
- *    - No race conditions
- *
- * Usage:
- * ------
- * For development: Falls back to in-memory if REDIS_URL not set
- * For production: Use AWS ElastiCache or Upstash (serverless)
- *
- * Upstash setup (recommended for interview demo):
- * 1. Sign up at https://upstash.com (free tier)
- * 2. Create a Redis database
- * 3. Copy the Redis URL to REDIS_URL env var
- */
-
 import { config } from '../config/index.js';
 import { logger } from './logger.js';
 
@@ -283,18 +253,63 @@ export const incrementRateLimit = async (key: string, windowSeconds: number): Pr
 };
 
 /**
- * Check current rate limit count without incrementing.
+ * Reset a rate limit (e.g., for admin unlock)
  */
-export const getRateLimitCount = async (key: string): Promise<number> => {
+export const resetRateLimit = async (key: string): Promise<void> => {
+  const redis = await getRedis();
+  await redis.del(key);
+};
+
+// =============================================================================
+// Account Lockout Helpers (Atomic Operations)
+// =============================================================================
+
+/**
+ * Atomically increment and check account lockout counter.
+ * SECURITY: Uses atomic Redis operations to prevent TOCTOU race conditions.
+ *
+ * Returns the current failed attempt count after incrementing.
+ * The counter auto-expires after the lockout window.
+ *
+ * @param email - User email to track
+ * @param windowMinutes - Lockout window in minutes
+ */
+export const incrementLockoutCounter = async (
+  email: string,
+  windowMinutes: number,
+): Promise<number> => {
+  const key = `lockout:${email}`;
+  const redis = await getRedis();
+  const count = await redis.incr(key);
+
+  // Set expiry only on first increment (atomic with incr in real Redis)
+  if (count === 1) {
+    await redis.expire(key, windowMinutes * 60);
+  }
+
+  return count;
+};
+
+/**
+ * Get current lockout count without incrementing.
+ * Used to check if account is locked before attempting auth.
+ *
+ * @param email - User email to check
+ */
+export const getLockoutCount = async (email: string): Promise<number> => {
+  const key = `lockout:${email}`;
   const redis = await getRedis();
   const value = await redis.get(key);
   return value ? parseInt(value, 10) : 0;
 };
 
 /**
- * Reset a rate limit (e.g., for admin unlock)
+ * Reset lockout counter (e.g., after successful login or admin unlock)
+ *
+ * @param email - User email to reset
  */
-export const resetRateLimit = async (key: string): Promise<void> => {
+export const resetLockoutCounter = async (email: string): Promise<void> => {
+  const key = `lockout:${email}`;
   const redis = await getRedis();
   await redis.del(key);
 };

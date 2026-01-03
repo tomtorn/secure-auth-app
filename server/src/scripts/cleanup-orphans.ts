@@ -1,17 +1,5 @@
 #!/usr/bin/env npx ts-node
 /* eslint-disable no-console */
-/**
- * CLI Script: Cleanup Orphan Users
- *
- * One-time script to remove users from RDS that don't exist in Supabase.
- * Also syncs email verification status for all users.
- *
- * Usage:
- *   npx ts-node src/scripts/cleanup-orphans.ts
- *
- * Or via npm script:
- *   npm run cleanup-orphans
- */
 
 import { syncService } from '../services/sync.service.js';
 import { checkDatabaseConnection, disconnectDatabase } from '../lib/prisma.js';

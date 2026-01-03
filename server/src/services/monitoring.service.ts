@@ -5,9 +5,10 @@
  */
 
 import { prisma } from '../lib/prisma.js';
-import { getCached, setCache } from '../lib/cache.js';
+import { getCached, setCache, clearCache } from '../lib/cache.js';
 import { fetchAwsMetrics } from '../lib/cloudwatch.js';
-import { checkSupabaseHealth } from '../lib/supabase-admin.js';
+import { checkSupabaseHealth, getSupabaseAuthStats } from '../lib/supabase-admin.js';
+import { checkRedisHealth } from '../lib/redis.js';
 import { authEventService } from './authEvent.service.js';
 import { logger } from '../lib/logger.js';
 import type { MonitoringData } from '@secure-auth/schemas';
@@ -31,17 +32,20 @@ export const monitoringService = {
 
     const oneDayAgo = new Date(Date.now() - ONE_DAY_MS);
 
-    // Fetch all metrics in parallel
-    const [awsMetrics, appMetrics, authCounts] = await Promise.all([
+    // Fetch all metrics in parallel (including Supabase auth stats)
+    const [awsMetrics, appMetrics, authCounts, supabaseStats] = await Promise.all([
       fetchAwsMetrics(),
       fetchAppMetrics(),
       authEventService.getCounts(oneDayAgo),
+      getSupabaseAuthStats(),
     ]);
 
-    // Auth metrics from auth_events table
-    // Note: dbSizeMb would require RDS API call - omitted for simplicity
+    // Auth metrics from auth_events table + Supabase stats
+    // SECURITY: Add fallbacks for undefined values to prevent schema validation failures
     const authMetrics = {
-      totalAuthUsers: appMetrics.totalUsers,
+      totalAuthUsers: supabaseStats.totalUsers ?? appMetrics.totalUsers,
+      confirmedUsers: supabaseStats.confirmedUsers ?? 0,
+      unconfirmedUsers: supabaseStats.unconfirmedUsers ?? 0,
       signups24h: authCounts.signUps,
       logins24h: authCounts.signIns,
       failedLogins24h: authCounts.signInsFailed,
@@ -92,23 +96,32 @@ export const monitoringService = {
   },
 
   /**
+   * Invalidate cached monitoring data.
+   * Call this when underlying data changes significantly.
+   */
+  invalidateCache: (): void => {
+    clearCache(CACHE_KEY);
+  },
+
+  /**
    * Get system health status
    */
   getHealth: async (): Promise<HealthCheckData> => {
     const startTime = Date.now();
 
-    // Check all services in parallel
-    const [dbStatus, authStatus] = await Promise.all([
+    // Check all services in parallel (including Redis now)
+    const [dbStatus, authStatus, redisStatus] = await Promise.all([
       checkDatabaseHealth(startTime),
       checkSupabaseHealth(),
+      checkRedisHealth(),
     ]);
 
-    const overallStatus =
-      dbStatus === 'down' || authStatus === 'down'
-        ? 'down'
-        : dbStatus === 'degraded' || authStatus === 'degraded'
-          ? 'degraded'
-          : 'operational';
+    const allStatuses = [dbStatus, authStatus, redisStatus];
+    const overallStatus = allStatuses.includes('down')
+      ? 'down'
+      : allStatuses.includes('degraded')
+        ? 'degraded'
+        : 'operational';
 
     return {
       status: overallStatus,
@@ -116,6 +129,7 @@ export const monitoringService = {
         api: 'operational',
         database: dbStatus,
         auth: authStatus,
+        redis: redisStatus,
       },
       timestamp: new Date().toISOString(),
     };
@@ -150,6 +164,7 @@ interface HealthCheckData {
     api: 'operational' | 'degraded' | 'down';
     database: 'operational' | 'degraded' | 'down';
     auth: 'operational' | 'degraded' | 'down';
+    redis: 'operational' | 'degraded' | 'down';
   };
   timestamp: string;
 }

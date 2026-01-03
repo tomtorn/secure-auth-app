@@ -1,11 +1,14 @@
+import crypto from 'crypto';
 import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { z } from 'zod';
 import { syncService } from '../services/sync.service.js';
+import { monitoringService } from '../services/monitoring.service.js';
 import { asyncHandler } from '../middleware/asyncHandler.js';
 import { logger } from '../lib/logger.js';
 import { config } from '../config/index.js';
 import { AppError } from '../services/errors.js';
+import { rateLimit } from '../middleware/rateLimit.js';
 
 export const webhooksRouter = Router();
 
@@ -36,24 +39,43 @@ const supabaseWebhookSchema = z.object({
 type SupabaseWebhookPayload = z.infer<typeof supabaseWebhookSchema>;
 
 /**
- * Verifies the webhook signature from Supabase.
- * Uses a shared secret configured in both Supabase and our server.
+ * Verifies the webhook request using a shared secret header.
+ * Supabase Database Webhooks don't support HMAC signing, so we use a custom header.
+ * SECURITY: Uses timing-safe comparison to prevent timing attacks.
  */
-const verifyWebhookSignature = (req: Request): boolean => {
-  const signature = req.headers['x-supabase-webhook-signature'];
-  const webhookSecret = config.supabaseWebhookSecret;
+const verifyWebhookSecret = (req: Request): boolean => {
+  const providedSecret = req.headers['x-webhook-secret'];
+  const expectedSecret = config.supabaseWebhookSecret;
 
-  if (!webhookSecret) {
+  if (!expectedSecret) {
     logger.warn('Supabase webhook secret not configured');
     return false;
   }
 
-  if (!signature || typeof signature !== 'string') {
+  if (!providedSecret || typeof providedSecret !== 'string') {
     return false;
   }
 
-  // Simple signature verification (in production, use HMAC)
-  return signature === webhookSecret;
+  // SECURITY: Use timing-safe comparison to prevent timing attacks
+  const expectedBuffer = Buffer.from(expectedSecret);
+  const providedBuffer = Buffer.from(providedSecret);
+
+  if (expectedBuffer.length !== providedBuffer.length) {
+    return false;
+  }
+
+  return crypto.timingSafeEqual(expectedBuffer, providedBuffer);
+};
+
+/**
+ * Parses the raw body buffer into JSON.
+ * Used after signature verification to get the actual payload.
+ */
+const parseWebhookBody = <T>(req: Request): T => {
+  if (Buffer.isBuffer(req.body)) {
+    return JSON.parse(req.body.toString('utf-8')) as T;
+  }
+  return req.body as T;
 };
 
 /**
@@ -65,15 +87,17 @@ const verifyWebhookSignature = (req: Request): boolean => {
  */
 webhooksRouter.post(
   '/supabase/auth',
+  rateLimit, // SECURITY: Rate limit webhooks to prevent DoS
   asyncHandler(async (req: Request, res: Response) => {
-    // Verify webhook signature
-    if (!verifyWebhookSignature(req)) {
-      logger.warn({ headers: req.headers }, 'Invalid webhook signature');
+    // Verify webhook secret
+    if (!verifyWebhookSecret(req)) {
+      logger.warn('Invalid webhook secret');
       throw new AppError('Unauthorized', 401);
     }
 
-    // Validate payload
-    const parseResult = supabaseWebhookSchema.safeParse(req.body);
+    // Parse raw body and validate payload
+    const rawPayload = parseWebhookBody(req);
+    const parseResult = supabaseWebhookSchema.safeParse(rawPayload);
     if (!parseResult.success) {
       logger.error({ errors: parseResult.error.errors }, 'Invalid webhook payload');
       throw new AppError('Invalid payload', 400);
@@ -98,8 +122,19 @@ webhooksRouter.post(
         // User updated in Supabase - sync to RDS
         const supabaseId = payload.record?.id;
         if (supabaseId) {
-          await syncService.syncSingleUser(supabaseId);
-          logger.info({ supabaseId }, 'Processed user update webhook');
+          // First verify the user exists in Supabase before syncing
+          const verification = await syncService.verifySupabaseUser(supabaseId);
+          if (verification?.exists) {
+            await syncService.syncSingleUser(supabaseId);
+            logger.info(
+              { supabaseId, emailVerified: verification.emailVerified },
+              'Processed user update webhook',
+            );
+            // Invalidate monitoring cache since user data changed
+            monitoringService.invalidateCache();
+          } else {
+            logger.warn({ supabaseId }, 'User not found in Supabase during update webhook');
+          }
         }
         break;
       }
@@ -123,9 +158,10 @@ webhooksRouter.post(
  */
 webhooksRouter.post(
   '/supabase/sync-all',
+  rateLimit, // SECURITY: Rate limit webhooks to prevent DoS
   asyncHandler(async (req: Request, res: Response) => {
-    // This endpoint requires the webhook secret as a simple auth mechanism
-    if (!verifyWebhookSignature(req)) {
+    // This endpoint requires the webhook secret
+    if (!verifyWebhookSecret(req)) {
       throw new AppError('Unauthorized', 401);
     }
 

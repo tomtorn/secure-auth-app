@@ -32,7 +32,7 @@ export const MonitoringPage = (): JSX.Element => {
   const lastUpdated = dataUpdatedAt ? new Date(dataUpdatedAt).toLocaleTimeString() : '-';
 
   // Invalidate all monitoring queries
-  const handleRefresh = () => {
+  const handleRefresh = (): void => {
     queryClient.invalidateQueries({ queryKey: ['monitoring'] });
     queryClient.invalidateQueries({ queryKey: ['health'] });
     queryClient.invalidateQueries({ queryKey: ['activity'] });

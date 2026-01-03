@@ -8,6 +8,7 @@ import {
   getStringHeader,
 } from '../lib/constants.js';
 import { config } from '../config/index.js';
+import { reportSecurityEvent, SecurityEvents } from '../lib/monitoring.js';
 
 // Re-export for convenience
 export { CSRF_COOKIE, CSRF_HEADER };
@@ -108,6 +109,10 @@ export const validateCsrf = (req: Request, res: Response, next: NextFunction): v
 
   // Header is REQUIRED: without it we always reject
   if (!headerToken) {
+    reportSecurityEvent(SecurityEvents.CSRF_INVALID, {
+      path: req.path,
+      reason: 'CSRF token missing',
+    });
     res.status(403).json({
       success: false,
       error: 'CSRF token missing',
@@ -124,6 +129,10 @@ export const validateCsrf = (req: Request, res: Response, next: NextFunction): v
       cookieBuffer.length !== headerBuffer.length ||
       !crypto.timingSafeEqual(cookieBuffer, headerBuffer)
     ) {
+      reportSecurityEvent(SecurityEvents.CSRF_INVALID, {
+        path: req.path,
+        reason: 'CSRF token mismatch',
+      });
       res.status(403).json({
         success: false,
         error: 'CSRF token mismatch',
@@ -137,6 +146,10 @@ export const validateCsrf = (req: Request, res: Response, next: NextFunction): v
 
   // STRATEGY 2: No cookie (cross-origin blocked), verify signed token
   if (!verifySignedToken(headerToken)) {
+    reportSecurityEvent(SecurityEvents.CSRF_INVALID, {
+      path: req.path,
+      reason: 'Invalid or expired CSRF token',
+    });
     res.status(403).json({
       success: false,
       error: 'Invalid or expired CSRF token',
