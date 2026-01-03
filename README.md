@@ -1,8 +1,8 @@
 # SecureAuth
 
-A **production-ready authentication system** demonstrating enterprise-grade security practices, built with React, Express, and deployed on AWS.
+A **production-ready authentication system** demonstrating enterprise-grade security practices, built with React, Express, and designed for AWS deployment.
 
-🔗 **Live Demo:** [https://main.d3ax6vp01v3bke.amplifyapp.com](https://main.d3ax6vp01v3bke.amplifyapp.com)
+> **Note:** This is a reference implementation. Clone the repo and deploy to your own AWS/Supabase accounts.
 
 ## Features
 
